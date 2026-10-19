@@ -29,7 +29,7 @@ class AdapterContractTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         socket_path = str(Path(self.tmp.name) / "bridge.sock")
-        config = SimpleNamespace(extra={"socket_path": socket_path})
+        config = SimpleNamespace(extra={"socket_path": socket_path, "burst_quiet_seconds": 0})
         self.adapter = RustPushIMessageAdapter(config, _platform=Platform.LOCAL)
         self.calls: list[tuple[str, dict]] = []
 
@@ -536,6 +536,124 @@ class AdapterContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(error[0], False)
 
+
+
+class InboundBurstTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        socket_path = str(Path(self.tmp.name) / "bridge.sock")
+        config = SimpleNamespace(extra={
+            "socket_path": socket_path, "burst_quiet_seconds": 0.2, "burst_max_seconds": 0.6,
+        })
+        self.adapter = RustPushIMessageAdapter(config, _platform=Platform.LOCAL)
+        self.calls: list[tuple[str, dict]] = []
+        self.handled: list = []
+
+        async def request(operation: str, **fields):
+            self.calls.append((operation, fields))
+            if operation == "materialize_attachment":
+                path = Path(self.tmp.name) / f"{fields['attachment_id']}.jpg"
+                path.write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 64)
+                return {"path": str(path)}
+            return {"ok": True}
+
+        async def handle(event):
+            self.handled.append(event)
+            event._gateway_accepted = True
+
+        self.adapter._request = request  # type: ignore[method-assign]
+        self.adapter.handle_message = handle  # type: ignore[method-assign]
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def message(self, n: int, **changes):
+        return {
+            "event_id": f"event-{n}", "kind": "message", "chat_id": "chat-1",
+            "native_id": f"native-{n}", "sender": "tel:+15555550100", "text": f"text {n}",
+            "timestamp_ms": 1_700_000_000_000 + n, **changes,
+        }
+
+    def photo(self, n: int, text: str = "\ufffc"):
+        return self.message(n, text=text, attachments=[{
+            "attachment_id": f"att-{n}", "available": True, "mime": "image/jpeg", "filename": f"p{n}.jpg",
+        }])
+
+    def acks(self) -> list[str]:
+        return [fields["event_id"] for op, fields in self.calls if op == "ack"]
+
+    async def test_photo_then_caption_becomes_one_message(self) -> None:
+        first = asyncio.create_task(self.adapter._on_event(self.photo(1)))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(self.adapter._on_event(self.message(2, text="what do you think?")))
+        await asyncio.gather(first, second)
+
+        self.assertEqual(len(self.handled), 1)
+        merged = self.handled[0]
+        self.assertEqual(merged.text, "what do you think?")
+        self.assertEqual(len(merged.media_urls), 1)
+        self.assertEqual(merged.message_type.name, "PHOTO")
+        self.assertEqual(merged.message_id, "native-2")
+        self.assertEqual(sorted(self.acks()), ["event-1", "event-2"])
+
+    async def test_several_photos_and_texts_merge_in_order(self) -> None:
+        tasks = []
+        for event in (self.message(1, text="here are both"), self.photo(2), self.photo(3), self.message(4, text="mine is second")):
+            tasks.append(asyncio.create_task(self.adapter._on_event(event)))
+            await asyncio.sleep(0.05)
+        await asyncio.gather(*tasks)
+
+        self.assertEqual(len(self.handled), 1)
+        merged = self.handled[0]
+        self.assertEqual(merged.text, "here are both\n\nmine is second")
+        self.assertEqual(len(merged.media_urls), 2)
+        self.assertEqual(merged.raw_message["burst_size"], 4)
+
+    async def test_quiet_gap_starts_a_new_message(self) -> None:
+        await self.adapter._on_event(self.message(1, text="first"))
+        await self.adapter._on_event(self.message(2, text="second"))
+        self.assertEqual([e.text for e in self.handled], ["first", "second"])
+
+    async def test_hard_cap_flushes_a_long_burst(self) -> None:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        tasks = []
+        for n in range(1, 8):  # 0.15s apart: never quiet for 0.2s
+            tasks.append(asyncio.create_task(self.adapter._on_event(self.message(n))))
+            await asyncio.sleep(0.15)
+        await asyncio.gather(*tasks)
+        self.assertGreaterEqual(len(self.handled), 2)
+        self.assertLess(loop.time() - started, 3.0)
+
+    async def test_other_sender_is_not_merged(self) -> None:
+        a = asyncio.create_task(self.adapter._on_event(self.message(1, text="mine")))
+        await asyncio.sleep(0.05)
+        b = asyncio.create_task(self.adapter._on_event(self.message(2, text="theirs", sender="tel:+15555550199")))
+        await asyncio.gather(a, b)
+        self.assertEqual(sorted(e.text for e in self.handled), ["mine", "theirs"])
+
+    async def test_rejected_burst_leaves_every_event_unacked(self) -> None:
+        async def reject(event):
+            self.handled.append(event)
+            event._gateway_accepted = False
+            raise RuntimeError("gateway down")
+
+        self.adapter.handle_message = reject  # type: ignore[method-assign]
+        a = asyncio.create_task(self.adapter._on_event(self.photo(1)))
+        await asyncio.sleep(0.05)
+        b = asyncio.create_task(self.adapter._on_event(self.message(2, text="caption")))
+        results = await asyncio.gather(a, b, return_exceptions=True)
+        self.assertTrue(all(isinstance(r, Exception) for r in results))
+        self.assertEqual(self.acks(), [])
+
+    def test_burst_settings_are_bounded(self) -> None:
+        config = SimpleNamespace(extra={
+            "socket_path": str(Path(self.tmp.name) / "x.sock"),
+            "burst_quiet_seconds": "nope", "burst_max_seconds": 999,
+        })
+        adapter = RustPushIMessageAdapter(config, _platform=Platform.LOCAL)
+        self.assertEqual(adapter._burst_quiet_s, 4.0)
+        self.assertEqual(adapter._burst_max_s, 60.0)
 
 if __name__ == "__main__":
     unittest.main()
