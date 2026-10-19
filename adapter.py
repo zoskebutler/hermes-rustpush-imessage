@@ -262,12 +262,16 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         # Inbound burst coalescing: iMessage delivers a photo and its caption
         # (or several quick texts) as separate events. Without a short quiet
         # period the first event starts a turn and the next one interrupts it.
-        self._burst_quiet_s = _bounded_float(extra.get("burst_quiet_seconds"), 4.0, 0.0, 15.0)
+        # The base window is short (photo + caption land within ~1s); it only
+        # stretches while the sender's typing indicator says more is coming.
+        self._burst_quiet_s = _bounded_float(extra.get("burst_quiet_seconds"), 1.0, 0.0, 15.0)
         self._burst_max_s = max(
             self._burst_quiet_s,
-            _bounded_float(extra.get("burst_max_seconds"), 20.0, 0.0, 60.0),
+            _bounded_float(extra.get("burst_max_seconds"), 30.0, 0.0, 120.0),
         )
+        self._typing_grace_s = _bounded_float(extra.get("typing_grace_seconds"), 15.0, 0.0, 60.0)
         self._bursts: dict[tuple[str, str], _InboundBurst] = {}
+        self._typing_until: dict[tuple[str, str], float] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # The gateway supplies this keyword on both cold-start and recovery
@@ -355,6 +359,7 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
             return
         kind = event.get("kind")
         if kind == "typing":
+            self._note_typing(event, active=True)
             await self._forward_platform_event(event)
             return
         message_key = None
@@ -546,6 +551,9 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         elif not text and declared_attachment_count:
             text = "[Attachment unavailable]"
         if not text:
+            # RustPush surfaces "stopped typing" (Typing(false)) as an empty
+            # message event: release any burst that was waiting on it.
+            self._note_typing(event, active=False)
             return False
         message_type = _message_type(media_types)
         timestamp_ms = event.get("timestamp_ms")
@@ -590,6 +598,22 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
                 on_admitted()
         return True
 
+    def _note_typing(self, event: Dict[str, Any], *, active: bool) -> None:
+        """Track the sender's typing indicator so a pending burst waits for them."""
+        if event.get("from_me") is True:
+            return
+        chat_id, sender = event.get("chat_id"), event.get("sender")
+        if not isinstance(chat_id, str) or not isinstance(sender, str):
+            return
+        key = (chat_id, sender)
+        if active and self._typing_grace_s > 0:
+            self._typing_until[key] = time.monotonic() + self._typing_grace_s
+        else:
+            self._typing_until.pop(key, None)
+        burst = self._bursts.get(key)
+        if burst is not None:
+            burst.wake()
+
     async def _dispatch_inbound(self, message_event: MessageEvent) -> None:
         """Hand an inbound message to the gateway, coalescing quick bursts.
 
@@ -605,6 +629,9 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
             await self.handle_message(message_event)
             return
         key = (message_event.source.chat_id, message_event.user_id or "")
+        # Sending a message ends that typing session; a new indicator will
+        # arrive if they keep typing.
+        self._typing_until.pop(key, None)
         burst = self._bursts.get(key)
         if burst is not None:
             burst.absorb(message_event)
@@ -615,7 +642,11 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         self._bursts[key] = burst
         try:
             try:
-                await burst.wait_quiet(self._burst_quiet_s, self._burst_max_s)
+                await burst.wait_quiet(
+                    self._burst_quiet_s,
+                    self._burst_max_s,
+                    lambda: self._typing_until.get(key, 0.0),
+                )
             finally:
                 # Close the window synchronously so a later event starts a
                 # new burst instead of joining one that is being dispatched.
@@ -985,11 +1016,19 @@ class _InboundBurst:
         self.last = time.monotonic()
         self._bumped.set()
 
-    async def wait_quiet(self, quiet_s: float, max_s: float) -> None:
-        """Return once no event arrived for ``quiet_s`` or ``max_s`` elapsed."""
+    def wake(self) -> None:
+        """Re-evaluate the deadline (typing state changed)."""
+        self._bumped.set()
+
+    async def wait_quiet(
+        self, quiet_s: float, max_s: float, typing_until: Callable[[], float] = lambda: 0.0
+    ) -> None:
+        """Return once the sender went quiet: no new event for ``quiet_s`` and
+        no active typing indicator, or ``max_s`` elapsed since the first event."""
         while True:
             now = time.monotonic()
-            timeout = min(self.last + quiet_s - now, self.started + max_s - now)
+            settle = max(self.last + quiet_s, typing_until())
+            timeout = min(settle - now, self.started + max_s - now)
             if timeout <= 0:
                 return
             self._bumped.clear()
