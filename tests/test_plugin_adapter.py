@@ -538,6 +538,17 @@ class AdapterContractTests(unittest.IsolatedAsyncioTestCase):
         adapter_module.register(Ctx())
         self.assertEqual(captured.get("cron_deliver_env_var"), "IMESSAGE_CLI_HOME_CHANNEL")
 
+    def test_is_connected_accepts_platform_config(self) -> None:
+        import adapter as adapter_module
+
+        good = SimpleNamespace(extra={"socket_path": "/tmp/bridge.sock"})
+        relative = SimpleNamespace(extra={"socket_path": "relative.sock"})
+        network = SimpleNamespace(extra={"socket_path": "/tmp/b.sock", "host": "0.0.0.0"})
+        self.assertTrue(adapter_module.is_connected(good))
+        self.assertFalse(adapter_module.is_connected(relative))
+        self.assertFalse(adapter_module.is_connected(network))
+        self.assertFalse(adapter_module.is_connected(None))
+
     def test_config_rejects_network_options(self) -> None:
         self.assertEqual(
             validate_config({"extra": {"socket_path": "/tmp/a.sock"}}),

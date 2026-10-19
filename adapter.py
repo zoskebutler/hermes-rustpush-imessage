@@ -948,8 +948,22 @@ def validate_config(config: Dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
-def is_connected(adapter: Any) -> bool:
-    return isinstance(adapter, RustPushIMessageAdapter) and adapter.is_connected
+def is_connected(target: Any) -> bool:
+    """Registry ``is_connected``: Hermes calls this with a ``PlatformConfig``
+    ("has the user configured this platform?"), e.g. from
+    ``GatewayConfig.get_connected_platforms`` and the cron delivery preflight.
+    The old adapter-only check returned False for every config, so cron
+    treated iMessage as unconnected and blocked all scheduled deliveries.
+    A live adapter still reports its own connection state."""
+    if isinstance(target, RustPushIMessageAdapter):
+        return target.is_connected
+    extra = getattr(target, "extra", None)
+    if extra is None and isinstance(target, dict):
+        extra = target.get("extra", target)
+    if not isinstance(extra, dict):
+        return False
+    ok, _reason = validate_config(extra)
+    return ok
 
 
 def register(ctx) -> None:
