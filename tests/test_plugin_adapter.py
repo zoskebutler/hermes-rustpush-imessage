@@ -526,6 +526,18 @@ class AdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accepted[0].text, "reaction:added:❤️")
         self.assertEqual(self.calls[-1][0], "ack")
 
+    def test_registers_as_cron_delivery_target(self) -> None:
+        import adapter as adapter_module
+
+        captured = {}
+
+        class Ctx:
+            def register_platform(self, **kwargs):
+                captured.update(kwargs)
+
+        adapter_module.register(Ctx())
+        self.assertEqual(captured.get("cron_deliver_env_var"), "IMESSAGE_CLI_HOME_CHANNEL")
+
     def test_config_rejects_network_options(self) -> None:
         self.assertEqual(
             validate_config({"extra": {"socket_path": "/tmp/a.sock"}}),

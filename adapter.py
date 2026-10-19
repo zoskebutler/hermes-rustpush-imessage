@@ -964,6 +964,10 @@ def register(ctx) -> None:
         is_connected=is_connected,
         allowed_users_env="RUSTPUSH_ALLOWED_USERS",
         allow_all_env="RUSTPUSH_ALLOW_ALL_USERS",
+        # Lets cron jobs deliver here (deliver=imessage_cli or an explicit
+        # imessage_cli:<chat_id>). Without it the scheduler's preflight treats
+        # the platform as unknown and blocks every scheduled message.
+        cron_deliver_env_var="IMESSAGE_CLI_HOME_CHANNEL",
         max_message_length=RustPushIMessageAdapter.MAX_MESSAGE_LENGTH,
         allow_update_command=False,
         pii_safe=True,
